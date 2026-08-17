@@ -33,18 +33,7 @@ $id = optional_param('id', 0, PARAM_INT); // course_module ID, or
 $n = optional_param('n', 0, PARAM_INT);  // solo instance ID
 $reattempt = optional_param('reattempt', 0, PARAM_INT);
 $embed = optional_param('embed', 0, PARAM_INT); // embed or not
-
-// Allow login through an authentication token.
-$userid = optional_param('user_id', null, PARAM_ALPHANUMEXT);
-$secret = optional_param('secret', null, PARAM_RAW);
-// Formerly had !isloggedin() check, but we want tologin afresh on each embedded access.
-if (!empty($userid) && !empty($secret)) {
-    if (mobile_auth::has_valid_token($userid, $secret)) {
-        $user = get_complete_user_data('id', $userid);
-        complete_user_login($user);
-        $embed = 2;
-    }
-}
+$userid = optional_param('userid', 0, PARAM_INT);
 
 if ($id) {
     $cm = get_coursemodule_from_id(constants::M_MODNAME, $id, 0, false, MUST_EXIST);
@@ -66,7 +55,7 @@ $config = get_config(constants::M_COMPONENT);
 $mode = 'attempts';
 
 // Set page url before require login, so post login will return here
-$PAGE->set_url(constants::M_URL . '/view.php', ['id' => $cm->id, 'mode' => $mode, 'embed' => $embed]);
+$PAGE->set_url(constants::M_URL . '/view.php', ['id' => $cm->id, 'mode' => $mode, 'embed' => $embed, 'userid' => $userid]);
 $PAGE->force_settings_menu(true);
 
 
@@ -98,7 +87,17 @@ if ($config->layout == constants::M_LAYOUT_NARROW) {
     $PAGE->add_body_class('mod-solo-layout-standard');
 }
 
-//this is a special case where the activity has been made with just a title and no speaking topic (placeholder)
+// Without working Poodll API credentials this activity cannot run. Administrators get an in page
+// setup panel, everybody else gets an explanation. This happens before any attempt is started.
+$credentialserror = $embed == 0 ? \mod_solo\cbcredentials::credentials_error() : '';
+if (!empty($credentialserror)) {
+    echo $renderer->header($moduleinstance, $cm, $mode, null, get_string('attempts', constants::M_COMPONENT));
+    echo $renderer->show_cbcredentials_setup($PAGE->url, $credentialserror);
+    echo $renderer->footer();
+    return;
+}
+
+// this is a special case where the activity has been made with just a title and no speaking topic (placeholder)
 if ($config->enablesetuptab && empty($moduleinstance->speakingtopic)) {
     echo $renderer->header($moduleinstance, $cm, $mode, null, get_string('attempts', constants::M_COMPONENT));
     if (has_capability('mod/solo:manage', $context)) {
