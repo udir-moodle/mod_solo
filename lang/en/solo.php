@@ -369,7 +369,6 @@ $string['transcriber'] = 'Transcriber';
 $string['transcriber_details'] = 'The transcription engine to use. ';
 $string['transcriber_open'] = 'Open transcription';
 // $string['transcriber_amazontranscribe'] = 'Regular transcription(AWS)';
-// $string['transcriber_amazonstreaming'] = 'Instant Transcription(AWS)';
 // $string['transcriber_googlechrome'] = 'Instant transcription (Chrome only)';
 // $string['transcriber_googlecloud'] = 'Quick Transcription(Google)(audio length < 60s ony)';
 $string['transcriber_none'] = 'No transcription';
@@ -898,8 +897,42 @@ $string['stats_ieltslevel'] = 'IELTS Level';
 $string['stats_toefllevel'] = 'TOEFL Level';
 $string['stats_genericlevel'] = 'Language Level';
 $string['enablenativelanguage'] = "Enable Native Language";
-$string['enablenativelanguage_details'] = 'If set, the student can choose their native language, this will override the default language of the feedback language that AI returns with the results. The language must currently be <a href="https://support.poodll.com/en/support/solutions/articles/19000163890-definitions-in-user-s-native-language">set in Poodll WordCards</a>, and it is picked up here.';
+$string['enablenativelanguage_details'] = 'If set, the student can choose their native language, this will override the default language of the feedback language that AI returns with the results. The language must currently be <a href="https://support.poodll.com/en/support/solutions/articles/19000163890-definitions-in-user-s-native-language">set in Poodll WordCards</a>, or Poodll MiniLesson, and it is used here.';
 $string['teacherfeedback'] = 'Teacher Feedback';
 $string['cloudpoodllserver'] = 'Cloud Poodll Server';
 $string['cloudpoodllserver_details'] = 'The server to use for Cloud Poodll. Only change this if Poodll has provided a different one.';
 $string['teachercomments'] = 'Teacher Comments';
+$string['streamingheading'] = 'Streaming speech recognition';
+$string['streamingheading_details'] = 'Settings for the in page recorder, which transcribes speech as the student records.';
+$string['azureapikey'] = 'Azure speech API key';
+$string['azureapikey_details'] = 'Optional. An Azure speech API key for streaming speech recognition. This is mainly for users in mainland China. If it is empty, streaming uses the Poodll speech service.';
+$string['azureapiregion'] = 'Azure speech region';
+$string['azureapiregion_details'] = 'The region of your Azure speech API key.';
+$string['allowmicaccess'] = 'Please allow access to your microphone.';
+$string['nomicdetected'] = 'No microphone detected.';
+$string['speechnotrecognized'] = 'We could not recognize your speech.';
+$string['streamrecord'] = 'Record';
+$string['streamingrecord'] = 'Use streaming recording';
+$string['streamingrecord_help'] = 'Record with the streaming recorder which transcribes while the student speaks, so results are ready as soon as they finish.
+
+"Prefer the browser" uses the browser\'s own speech recognition where it has it, which covers many more languages. Falls back to cloud streaming otherwise.
+
+"Cloud recogniser only" always uses the cloud recogniser, and keeps the non-streaming recorder chosen above for languages it does not cover.
+
+The video and the Upload recorder will not use streaming.';
+$string['streamingrecord_off'] = 'No, use the standard recorder (above)';
+$string['streamingrecord_preferbrowser'] = 'Yes, use browser speech recognition';
+$string['streamingrecord_cloudonly'] = 'Yes, use cloud recognition';
+$string['streamingrecord_default'] = 'Streaming recorder by default';
+$string['streamingrecord_default_details'] = 'What new activities use for recording. Each activity can change this in its settings.';
+$string['streamstop'] = 'Stop';
+$string['streamrerecord'] = 'Record again';
+$string['streamsettings'] = 'Recorder settings';
+$string['streammicrophone'] = 'Microphone';
+$string['streammicdefault'] = 'Default microphone';
+$string['streamdownload'] = 'Download your recording';
+$string['streamuploading'] = 'Saving your recording: {$a}%';
+$string['streamuploaded'] = 'Your recording is saved.';
+$string['streamuploadfailed'] = 'Your recording could not be saved. Please record again.';
+$string['streamrecording'] = 'Recording';
+$string['stepsubmitfailed'] = 'Your recording could not be submitted. Please record again, or try again later.';
