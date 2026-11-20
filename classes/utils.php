@@ -185,10 +185,36 @@ class utils
     // check if curl return from transcript url is valid
     public static function is_valid_transcript($transcript)
     {
+        if ($transcript === false) {
+            return false;
+        }
         if (strpos($transcript, "<Error><Code>AccessDenied</Code>") > 0) {
             return false;
         }
         return true;
+    }
+
+    /**
+     * Fetch a transcript file from S3.
+     *
+     * Moodle's curl returns its error message in place of the response when the request fails, and S3 answers
+     * with an error document for a missing file or a server fault. Without this check a message such as
+     * "Failed to connect to s3.amazonaws.com port 443" was stored and graded as the student's transcript.
+     *
+     * @param string $url
+     * @return string|false the file contents, or false if the file could not be fetched
+     */
+    public static function fetch_from_s3($url) {
+        global $CFG;
+
+        require_once($CFG->libdir . '/filelib.php');
+        $curl = new \curl();
+        $result = $curl->get($url);
+        $info = $curl->get_info();
+        if ($curl->get_errno() || empty($info['http_code']) || $info['http_code'] != 200) {
+            return false;
+        }
+        return $result;
     }
 
     public static function transcripts_are_ready_on_s3($attempt)
@@ -198,9 +224,8 @@ class utils
             return false;
         }
         $transcripturl = $attempt->filename . '.txt';
-        $postdata = [];
         // Fetch transcripts, and bail out of they are not ready or wrong.
-        $transcript = self::curl_fetch($transcripturl, $postdata);
+        $transcript = self::fetch_from_s3($transcripturl);
         return self::is_valid_transcript($transcript);
     }
 
@@ -216,14 +241,14 @@ class utils
         $jsontranscripturl = $attempt->filename . '.json';
         $vtttranscripturl = $attempt->filename . '.vtt';
         $transcripturl = $attempt->filename . '.txt';
-        $postdata = [];
         // fetch transcripts, and bail out of they are not ready or wrong
-        $jsontranscript = self::curl_fetch($jsontranscripturl, $postdata);
-        if (!self::is_valid_transcript($jsontranscript)) {
+        // A network failure or an S3 error leaves them unfetched, so the adhoc task tries again later.
+        $jsontranscript = self::fetch_from_s3($jsontranscripturl);
+        if (!self::is_valid_transcript($jsontranscript) || !is_array(json_decode($jsontranscript, true))) {
             return false;
         }
 
-        $transcript = self::curl_fetch($transcripturl, $postdata);
+        $transcript = self::fetch_from_s3($transcripturl);
         if (!self::is_valid_transcript($transcript)) {
             return false;
         }
@@ -231,7 +256,7 @@ class utils
         // The subtitles are optional. Nothing reads them, and the streaming recorder's uploader does not ask for
         // them (subtitle=0), so its backup transcription never makes a .vtt. Requiring one left those attempts
         // waiting for a file that would never come. Keep it when the cloud made one, as the iframe recorder asks it to.
-        $vtttranscript = self::curl_fetch($vtttranscripturl, $postdata);
+        $vtttranscript = self::fetch_from_s3($vtttranscripturl);
         if (!$vtttranscript || !self::is_valid_transcript($vtttranscript)) {
             $vtttranscript = '';
         }
@@ -560,7 +585,7 @@ class utils
         // Speech recognised in the browser comes back with no punctuation at all, so add it before the statistics,
         // the grammar check and the AI grade read the transcript.
         if ($hastranscripts) {
-            $attempt = self::punctuate_attempt_transcript($attempt, $moduleinstance);
+            $attempt = self::punctuate_attempt_transcript($attempt, $moduleinstance, $contextid);
         }
 
         if ($hastranscripts) {
@@ -601,7 +626,8 @@ class utils
             $moduleinstance->ttslanguage,
             $moduleinstance->modelttsembedding,
             $userlanguage,
-            $targettopic
+            $targettopic,
+            $contextid
         );
 
         // update statistics and grammar correction if we need to
@@ -664,15 +690,23 @@ class utils
             $instructions->questiontext = strip_tags($moduleinstance->speakingtopic);
             $instructions->modeltext = '';
             $isspeech = !self::is_textonlysubmission($moduleinstance);
-            $aigraderesults = self::fetch_ai_grade($token, $moduleinstance->region, $moduleinstance->ttslanguage, $isspeech, $studentresponse, $instructions);
+            $aigraderesults = self::fetch_ai_grade(
+                $token,
+                $moduleinstance->region,
+                $moduleinstance->ttslanguage,
+                $isspeech,
+                $studentresponse,
+                $instructions,
+                $contextid
+            );
             $attempt = self::store_ai_grade($attempt, $aigraderesults);
         }
 
         // Process grammar correction (it won't fetch again if it has it already)
         if ($aigraderesults && isset($aigraderesults->correctedtext)) {
-            self::process_grammar_correction($moduleinstance, $attempt, $aigraderesults->correctedtext);
+            self::process_grammar_correction($moduleinstance, $attempt, $aigraderesults->correctedtext, $contextid);
         } else {
-            self::process_grammar_correction($moduleinstance, $attempt);
+            self::process_grammar_correction($moduleinstance, $attempt, false, $contextid);
         }
 
         // if we have an ungraded activity, lets grade it
@@ -740,10 +774,14 @@ class utils
      * @param string $region
      * @param string $language The activity language, eg en-US.
      * @param string $text
+     * @param int|null $contextid The activity's context, for the Moodle AI action register.
      * @return string|false The punctuated text, or false if the service could not do it.
      */
-    public static function fetch_punctuated_text($token, $region, $language, $text)
+    public static function fetch_punctuated_text($token, $region, $language, $text, $contextid = null)
     {
+        if (aimanager::uses_moodle_ai()) {
+            return (new aimanager($contextid, $language))->punctuate($text);
+        }
         $params = [
             'wstoken' => $token,
             'wsfunction' => 'local_cpapi_call_ai',
@@ -776,22 +814,33 @@ class utils
      *
      * @param \stdClass $attempt
      * @param \stdClass $moduleinstance
+     * @param int|null $contextid The activity's context, for the Moodle AI action register.
      * @return \stdClass The attempt, punctuated if it could be.
      */
-    public static function punctuate_attempt_transcript($attempt, $moduleinstance)
+    public static function punctuate_attempt_transcript($attempt, $moduleinstance, $contextid = null)
     {
         global $DB;
 
         if (!self::needs_punctuation($attempt->transcript)) {
             return $attempt;
         }
-        $siteconfig = get_config(constants::M_COMPONENT);
-        $token = self::fetch_token($siteconfig->apiuser, $siteconfig->apisecret);
-        if (empty($token)) {
-            return $attempt;
+        // A Moodle AI provider needs no Cloud Poodll token.
+        $token = '';
+        if (!aimanager::uses_moodle_ai()) {
+            $siteconfig = get_config(constants::M_COMPONENT);
+            $token = self::fetch_token($siteconfig->apiuser, $siteconfig->apisecret);
+            if (empty($token)) {
+                return $attempt;
+            }
         }
         $language = $moduleinstance->ttslanguage;
-        $punctuated = self::fetch_punctuated_text($token, $moduleinstance->region, $language, $attempt->transcript);
+        $punctuated = self::fetch_punctuated_text(
+            $token,
+            $moduleinstance->region,
+            $language,
+            $attempt->transcript,
+            $contextid
+        );
         if ($punctuated === false) {
             return $attempt;
         }
@@ -851,10 +900,16 @@ class utils
         return $attempt;
     }
 
-    /*
-     * Process grammar correction details as returned by text analyser
+    /**
+     * Fetch and store the grammar correction for an attempt, if it has none yet.
+     *
+     * @param \stdClass $moduleinstance
+     * @param \stdClass $attempt
+     * @param string|false $corrections A correction already made (by the AI grade), or false to ask for one.
+     * @param int|null $contextid The activity's context, for the Moodle AI action register.
+     * @return string|false|null The grammar correction.
      */
-    public static function process_grammar_correction($moduleinstance, $attempt, $corrections = false)
+    public static function process_grammar_correction($moduleinstance, $attempt, $corrections = false, $contextid = null)
     {
         global $DB;
 
@@ -869,7 +924,16 @@ class utils
                 $siteconfig = get_config(constants::M_COMPONENT);
                 $token = self::fetch_token($siteconfig->apiuser, $siteconfig->apisecret);
                 // get text analyser
-                $textanalyser = new textanalyser($token, $attempt->selftranscript, $moduleinstance->region, $moduleinstance->ttslanguage);
+                $textanalyser = new textanalyser(
+                    $token,
+                    $attempt->selftranscript,
+                    $moduleinstance->region,
+                    $moduleinstance->ttslanguage,
+                    false,
+                    false,
+                    false,
+                    $contextid
+                );
                 $gcdata = $textanalyser->process_grammar_correction($attempt->selftranscript, $corrections);
                 $grammarcorrection = $gcdata['gcorrections'];
                 $gcerrors = $gcdata['gcerrors'];
@@ -905,83 +969,6 @@ class utils
             }
         }
         return $attempt->grammarcorrection;
-    }
-
-    /*
-     * TO DO -  remove this
-     */
-    public static function process_relevance($moduleinstance, $attempt, $stats)
-    {
-        global $DB;
-
-        // if there is a relevance and its not null, then return that
-        if (isset($stats->relevance) && $stats->relevance != null) {
-            return $stats->relevance;
-        }
-        $relevance = false;// default is blank
-        if (!empty($attempt->selftranscript)) {
-            $siteconfig = get_config(constants::M_COMPONENT);
-            $token = self::fetch_token($siteconfig->apiuser, $siteconfig->apisecret);
-            $textanalyser = new textanalyser($token, $attempt->selftranscript, $moduleinstance->region, $moduleinstance->ttslanguage);
-            $modelembedding = !empty($moduleinstance->modelttsembedding) ? $moduleinstance->modelttsembedding : $moduleinstance->modeltts;
-            $relevance = $textanalyser->fetch_relevance($modelembedding);
-        }
-        if ($relevance !== false) {
-            return $relevance;
-        } else {
-            return 0;
-        }
-    }
-
-    /*
-     * TO DO -  remove this
-     */
-    public static function process_cefr_level($moduleinstance, $attempt, $stats)
-    {
-        global $DB;
-
-        // if there is a cefrlevel and its not null, then return that
-        if (isset($stats->cefrlevel) && $stats->cefrlevel != null) {
-            return $stats->cefrlevel;
-        }
-        $cefrlevel = false;// default is blank
-        if (!empty($attempt->selftranscript)) {
-            $siteconfig = get_config(constants::M_COMPONENT);
-            $token = self::fetch_token($siteconfig->apiuser, $siteconfig->apisecret);
-            $textanalyser = new textanalyser($token, $attempt->selftranscript, $moduleinstance->region, $moduleinstance->ttslanguage);
-            $cefrlevel = $textanalyser->fetch_cefr_level();
-        }
-        if ($cefrlevel !== false) {
-            return $cefrlevel;
-        } else {
-            return "";
-        }
-    }
-
-    /*
-     * TO DO - remove this function, it is now in textanalyser
-     */
-    public static function process_idea_count($moduleinstance, $attempt, $stats)
-    {
-        global $DB;
-
-        // if there is an ideacount and its not null, then return that
-        if (isset($stats->ideacount) && $stats->ideacount != null) {
-            return $stats->ideacount;
-        }
-        $ideacount = false;
-        if (!empty($attempt->selftranscript)) {
-            $siteconfig = get_config(constants::M_COMPONENT);
-            $token = self::fetch_token($siteconfig->apiuser, $siteconfig->apisecret);
-            $textanalyser = new textanalyser($token, $attempt->selftranscript, $moduleinstance->region, $moduleinstance->ttslanguage);
-            $ideacount = $textanalyser->fetch_idea_count();
-        }
-        if ($ideacount !== false) {
-            return $ideacount;
-        } else {
-            return 0;
-        }
-
     }
 
     public static function fetch_grammar_correction_diff($selftranscript, $correction, $direction = 'l2r')
@@ -1636,17 +1623,13 @@ class utils
     public static function fetch_feedback_language($moduleinstance, $attempt)
     {
         $siteconfig = get_config(constants::M_COMPONENT);
-        //its awful but we hijack the wordcard's student native language setting
+        // The native language the student chose in Poodll WordCards or Poodll MiniLesson overrides the activity's.
         $feedbacklanguage = $moduleinstance->feedbacklanguage;
         if ($siteconfig->setnativelanguage) {
-            $userprefdeflanguage = get_user_preferences('wordcards_deflang', null, $attempt->userid);
-            if (!empty($userprefdeflanguage)) {
-                //the WC language is 2 char (eg 'en') but Poodll AI expects a locale code (eg 'en-US')
-                $wclanguage = self::lang_to_locale($userprefdeflanguage);
-                //if we did get a locale code back lets use that.
-                if ($wclanguage !== $userprefdeflanguage && $wclanguage !== $feedbacklanguage) {
-                    $feedbacklanguage = $wclanguage;
-                }
+            $nativelanguage = get_user_preferences(constants::NATIVELANG_PREF, null, $attempt->userid);
+            if (!empty($nativelanguage)) {
+                // The preference is a locale code. Poodll AI expects one too, and a locale code passes through unchanged.
+                $feedbacklanguage = self::lang_to_locale($nativelanguage);
             }
         }
         return $feedbacklanguage;
@@ -3164,266 +3147,6 @@ class utils
 
         // these need to be returned and echo'ed to the page
         return $rec;
-
-    }
-
-    /*
-     * 2023/05/13 - Delete this
-     */
-
-    // fetch the grammar correction suggestions
-    public static function fetch_grammar_correction($token, $region, $ttslanguage, $passage)
-    {
-        global $USER;
-
-        // The REST API we are calling
-        $functionname = 'local_cpapi_call_ai';
-
-        $params = [];
-        $params['wstoken'] = $token;
-        $params['wsfunction'] = $functionname;
-        $params['moodlewsrestformat'] = 'json';
-        $params['action'] = 'request_grammar_correction';
-        $params['appid'] = 'mod_solo';
-        $params['prompt'] = $passage;// urlencode($passage);
-        $params['language'] = $ttslanguage;
-        $params['subject'] = 'none';
-        $params['region'] = $region;
-        $params['owner'] = hash('md5', $USER->username);
-
-        // log.debug(params);
-
-        $serverurl = self::get_cloud_poodll_server() . '/webservice/rest/server.php';
-        $response = self::curl_fetch($serverurl, $params);
-        if (!self::is_json($response)) {
-            return false;
-        }
-        $payloadobject = json_decode($response);
-
-        // returnCode > 0  indicates an error
-        if (!isset($payloadobject->returnCode) || $payloadobject->returnCode > 0) {
-            return false;
-            // if all good, then lets do the embed
-        } else if ($payloadobject->returnCode === 0) {
-            $correction = $payloadobject->returnMessage;
-            // clean up the correction a little
-            if (\core_text::strlen($correction) > 0) {
-                $correction = self::super_trim($correction);
-                $charone = substr($correction, 0, 1);
-                if (preg_match('/^[.,:!?;-]/', $charone)) {
-                    $correction = substr($correction, 1);
-                }
-            }
-
-            return $correction;
-        } else {
-            return false;
-        }
-    }
-
-    /*
-     * 2023/05/13 - Delete this
-     */
-
-    // fetch the relevance
-    public static function fetch_relevance($token, $moduleinstance, $passage)
-    {
-        global $USER;
-
-        // default to 100% relevant if no TTS model or if it's not English
-        if (!self::is_english($moduleinstance->ttslanguage) || empty($moduleinstance->modeltts)) {
-            return 1;
-        }
-
-        // The REST API we are calling
-        $functionname = 'local_cpapi_call_ai';
-
-        $params = [];
-        $params['wstoken'] = $token;
-        $params['wsfunction'] = $functionname;
-        $params['moodlewsrestformat'] = 'json';
-        $params['action'] = 'get_semantic_sim';
-        $params['appid'] = 'mod_solo';
-        $params['prompt'] = $passage;// urlencode($passage);
-        $params['subject'] = !empty($moduleinstance->modelttsembedding) ? $moduleinstance->modelttsembedding : $moduleinstance->modeltts;
-        $params['language'] = $moduleinstance->ttslanguage;
-        $params['region'] = $moduleinstance->region;
-        $params['owner'] = hash('md5', $USER->username);
-
-        // log.debug(params);
-
-        $serverurl = self::get_cloud_poodll_server() . '/webservice/rest/server.php';
-        $response = self::curl_fetch($serverurl, $params, 'post');
-        if (!self::is_json($response)) {
-            return false;
-        }
-        $payloadobject = json_decode($response);
-
-        // returnCode > 0  indicates an error
-        if (!isset($payloadobject->returnCode) || $payloadobject->returnCode > 0) {
-            return false;
-            // if all good, then return the value
-        } else if ($payloadobject->returnCode === 0) {
-            $relevance = $payloadobject->returnMessage;
-            if (is_numeric($relevance)) {
-                $relevance = (int) round($relevance * 100, 0);
-            } else {
-                $relevance = false;
-            }
-            return $relevance;
-        } else {
-            return false;
-        }
-    }
-
-    /*
-     * 2023/05/13 - Delete this
-     */
-    // fetch the CEFR Level
-    public static function fetch_cefr_level($token, $region, $ttslanguage, $passage)
-    {
-        global $USER;
-
-        // The REST API we are calling
-        $functionname = 'local_cpapi_call_ai';
-
-        $params = [];
-        $params['wstoken'] = $token;
-        $params['wsfunction'] = $functionname;
-        $params['moodlewsrestformat'] = 'json';
-        $params['action'] = 'predict_cefr';
-        $params['appid'] = 'mod_solo';
-        $params['prompt'] = $passage;// urlencode($passage);
-        $params['language'] = $ttslanguage;
-        $params['subject'] = 'none';
-        $params['region'] = $region;
-        $params['owner'] = hash('md5', $USER->username);
-
-        // log.debug(params);
-
-        $serverurl = self::get_cloud_poodll_server() . '/webservice/rest/server.php';
-        $response = self::curl_fetch($serverurl, $params);
-        if (!self::is_json($response)) {
-            return false;
-        }
-        $payloadobject = json_decode($response);
-
-        // returnCode > 0  indicates an error
-        if (!isset($payloadobject->returnCode) || $payloadobject->returnCode > 0) {
-            return false;
-            // if all good, then return the value
-        } else if ($payloadobject->returnCode === 0) {
-            $cefr = $payloadobject->returnMessage;
-            // make pretty sure its a CEFR level
-            if (\core_text::strlen($cefr) !== 2) {
-                $cefr = false;
-            }
-
-            return $cefr;
-        } else {
-            return false;
-        }
-    }
-
-    /*
-     * 2023/05/13 - Delete this
-     */
-    // fetch embedding
-    public static function fetch_embedding($token, $moduleinstance, $passage)
-    {
-        global $USER;
-
-        // The REST API we are calling
-        $functionname = 'local_cpapi_call_ai';
-
-        $params = [];
-        $params['wstoken'] = $token;
-        $params['wsfunction'] = $functionname;
-        $params['moodlewsrestformat'] = 'json';
-        $params['action'] = 'get_embedding';
-        $params['appid'] = 'mod_solo';
-        $params['prompt'] = $passage;// urlencode($passage);
-        $params['language'] = $moduleinstance->ttslanguage;
-        $params['subject'] = 'none';
-        $params['region'] = $moduleinstance->region;
-        $params['owner'] = hash('md5', $USER->username);
-
-        // log.debug(params);
-
-        $serverurl = self::get_cloud_poodll_server() . '/webservice/rest/server.php';
-        $response = self::curl_fetch($serverurl, $params);
-        if (!self::is_json($response)) {
-            return false;
-        }
-        $payloadobject = json_decode($response);
-
-        // returnCode > 0  indicates an error
-        if (!isset($payloadobject->returnCode) || $payloadobject->returnCode > 0) {
-            return false;
-            // if all good, then process  it
-        } else if ($payloadobject->returnCode === 0) {
-            $returndata = $payloadobject->returnMessage;
-            // clean up the correction a little
-            if (!self::is_json($returndata)) {
-                $embedding = false;
-            } else {
-                $dataobject = json_decode($returndata);
-                if (is_array($dataobject) && $dataobject[0]->object == 'embedding') {
-                    $embedding = json_encode($dataobject[0]->embedding);
-                } else {
-                    $embedding = false;
-                }
-            }
-            return $embedding;
-        } else {
-            return false;
-        }
-    }
-
-    // fetch the Idea Count
-    public static function fetch_idea_count($token, $moduleinstance, $passage)
-    {
-        global $USER;
-
-        // The REST API we are calling
-        $functionname = 'local_cpapi_call_ai';
-
-        $params = [];
-        $params['wstoken'] = $token;
-        $params['wsfunction'] = $functionname;
-        $params['moodlewsrestformat'] = 'json';
-        $params['action'] = 'count_unique_ideas';
-        $params['appid'] = 'mod_solo';
-        $params['prompt'] = $passage;// urlencode($passage);
-        $params['language'] = $moduleinstance->ttslanguage;
-        $params['subject'] = 'none';
-        $params['region'] = $moduleinstance->region;
-        $params['owner'] = hash('md5', $USER->username);
-
-        // log.debug(params);
-
-        $serverurl = self::get_cloud_poodll_server() . '/webservice/rest/server.php';
-        $response = self::curl_fetch($serverurl, $params);
-        if (!self::is_json($response)) {
-            return false;
-        }
-        $payloadobject = json_decode($response);
-
-        // returnCode > 0  indicates an error
-        if (!isset($payloadobject->returnCode) || $payloadobject->returnCode > 0) {
-            return false;
-            // if all good, then lets do the embed
-        } else if ($payloadobject->returnCode === 0) {
-            $ideacount = $payloadobject->returnMessage;
-            // clean up the correction a little
-            if (!is_number($ideacount)) {
-                $ideacount = false;
-            }
-
-            return $ideacount;
-        } else {
-            return false;
-        }
     }
 
     // fetch slightly slower version of speech
@@ -3531,7 +3254,22 @@ class utils
         }
         $siteconfig = get_config(constants::M_COMPONENT);
         $token = self::fetch_token($siteconfig->apiuser, $siteconfig->apisecret);
-        $textanalyser = new textanalyser($token, $moduleinstance->modelanswer, $moduleinstance->region, $moduleinstance->ttslanguage);
+        // The form data carries the course module, for the Moodle AI action register.
+        $contextid = null;
+        if (!empty($moduleinstance->coursemodule)) {
+            $context = \context_module::instance($moduleinstance->coursemodule, IGNORE_MISSING);
+            $contextid = $context ? $context->id : null;
+        }
+        $textanalyser = new textanalyser(
+            $token,
+            $moduleinstance->modelanswer,
+            $moduleinstance->region,
+            $moduleinstance->ttslanguage,
+            false,
+            false,
+            false,
+            $contextid
+        );
         $embedding = $textanalyser->fetch_embedding();
         $ideacount = $textanalyser->fetch_idea_count();
         if ($embedding) {
@@ -4264,10 +4002,34 @@ class utils
     }
 
 
-    // fetch the AI Grade
-    public static function fetch_ai_grade($token, $region, $ttslanguage, $isspeech, $studentresponse, $instructions)
-    {
+    /**
+     * Fetch the AI grade and feedback for a student's response.
+     *
+     * Goes to Cloud Poodll, or to the Moodle AI provider chosen in the plugin settings.
+     *
+     * @param string $token The Cloud Poodll token.
+     * @param string $region
+     * @param string $ttslanguage The activity language, eg en-US.
+     * @param bool $isspeech The response is a speech transcript.
+     * @param string $studentresponse
+     * @param \stdClass $instructions feedbackscheme, feedbacklanguage, markscheme, maxmarks, questiontext, modeltext
+     * @param int|null $contextid The activity's context, for the Moodle AI action register.
+     * @return \stdClass|false correctedtext, and marks and feedback where given, or false on failure.
+     */
+    public static function fetch_ai_grade(
+        $token,
+        $region,
+        $ttslanguage,
+        $isspeech,
+        $studentresponse,
+        $instructions,
+        $contextid = null
+    ) {
         global $USER;
+
+        if (aimanager::uses_moodle_ai()) {
+            return (new aimanager($contextid, $ttslanguage))->autograde($studentresponse, $instructions, $isspeech);
+        }
         $instructionsjson = json_encode($instructions);
         // The REST API we are calling
         $functionname = 'local_cpapi_call_ai';
@@ -4301,23 +4063,29 @@ class utils
             return false;
             // if all good, then lets return
         } else if ($payloadobject->returnCode === 0) {
-            $autograderesponse = $payloadobject->returnMessage;
-            // clean up the correction a little
-            if (\core_text::strlen($autograderesponse) > 0 && self::is_json($autograderesponse)) {
-                $autogradeobj = json_decode($autograderesponse);
-                if (isset($autogradeobj->feedback) && $autogradeobj->feedback == null) {
-                    unset($autogradeobj->feedback);
-                }
-                if (isset($autogradeobj->marks) && $autogradeobj->marks == null) {
-                    unset($autogradeobj->marks);
-                }
-                return $autogradeobj;
-            } else {
-                return false;
-            }
+            return self::decode_ai_grade($payloadobject->returnMessage);
         } else {
             return false;
         }
+    }
+
+    /**
+     * Turn the AI grade Cloud Poodll sent back into an object.
+     *
+     * A mark of 0 is kept: it is a real grade. Callers treat a missing or null mark as "no AI grade".
+     *
+     * @param string $autograderesponse The JSON the AI returned.
+     * @return \stdClass|false correctedtext, marks and feedback, or false if it is not JSON.
+     */
+    public static function decode_ai_grade($autograderesponse) {
+        if (\core_text::strlen((string) $autograderesponse) === 0 || !self::is_json($autograderesponse)) {
+            return false;
+        }
+        $autogradeobj = json_decode($autograderesponse);
+        if (isset($autogradeobj->feedback) && $autogradeobj->feedback == null) {
+            unset($autogradeobj->feedback);
+        }
+        return $autogradeobj;
     }
 
     public static function is_complete($rule, $moduleinstance, $cm, $userid)

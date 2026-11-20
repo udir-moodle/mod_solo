@@ -51,7 +51,7 @@ class mod_solo_external extends external_api
 
         $siteconfig = get_config(constants::M_COMPONENT);
         $token = utils::fetch_token($siteconfig->apiuser, $siteconfig->apisecret);
-        $textanalyser = new textanalyser($token, $text, $mod->region, $mod->ttslanguage);
+        $textanalyser = new textanalyser($token, $text, $mod->region, $mod->ttslanguage, false, false, false, $context->id);
         $suggestions = $textanalyser->fetch_grammar_correction();
         if ($suggestions == $text || empty($suggestions)) {
             return "";
@@ -201,6 +201,10 @@ class mod_solo_external extends external_api
         parse_str($serialiseddata, $data);
         $modulecontext = context_module::instance($cmid);
         $cm = get_coursemodule_from_id(constants::M_MODNAME, $cmid, 0, false, MUST_EXIST);
+        // The grade is written to this activity, so check the grading permission here.
+        $gradedcontext = context_module::instance($cm->id);
+        self::validate_context($gradedcontext);
+        require_capability('mod/solo:grades', $gradedcontext);
         $attempthelper = new \mod_solo\attempthelper($cm);
         $attempt = $attempthelper->fetch_latest_complete_attempt($studentid);
 
@@ -317,6 +321,10 @@ class mod_solo_external extends external_api
         parse_str($serialiseddata, $data);
 
         $cm = get_coursemodule_from_id(constants::M_MODNAME, $cmid, 0, false, MUST_EXIST);
+        // The grade is written to this activity, so check the grading permission here.
+        $gradedcontext = context_module::instance($cm->id);
+        self::validate_context($gradedcontext);
+        require_capability('mod/solo:grades', $gradedcontext);
         $attempthelper = new \mod_solo\attempthelper($cm);
         $attempt = $attempthelper->fetch_latest_complete_attempt($studentid);
 
@@ -587,7 +595,8 @@ class mod_solo_external extends external_api
 
         $siteconfig = get_config(constants::M_COMPONENT);
         $token = utils::fetch_token($siteconfig->apiuser, $siteconfig->apisecret);
-        if (empty($token)) {
+        // A Moodle AI provider needs no Cloud Poodll token.
+        if (empty($token) && !\mod_solo\aimanager::uses_moodle_ai()) {
             return ["correctedtext" => "An error occurred", "feedback" => ["Invalid API credentials"], "marks" => 0];
         }
         if (empty($targetlanguage)) {
@@ -598,14 +607,10 @@ class mod_solo_external extends external_api
         if (!empty($studentresponse) && !empty($feedbackscheme) && $maxmarks > 0) {
             //Feedback language for AI instructions
             if ($siteconfig->setnativelanguage) {
-                $userprefdeflanguage = get_user_preferences('wordcards_deflang');
-                if (!empty($userprefdeflanguage)) {
-                    //the WC language is 2 char (eg 'en') but Poodll AI expects a locale code (eg 'en-US')
-                    $wc_language = utils::lang_to_locale($userprefdeflanguage);
-                    //if we did get a locale code back lets use that.
-                    if ($wc_language !== $userprefdeflanguage && $wc_language !== $feedbacklanguage) {
-                        $feedbacklanguage = $wc_language;
-                    }
+                $nativelanguage = get_user_preferences(constants::NATIVELANG_PREF);
+                if (!empty($nativelanguage)) {
+                    // The preference is a locale code. Poodll AI expects one too, and a locale code passes through unchanged.
+                    $feedbacklanguage = utils::lang_to_locale($nativelanguage);
                 }
             }//end of feedback language
 
@@ -621,7 +626,15 @@ class mod_solo_external extends external_api
             // At this point we do not have a module instance to help us establish if its text only, assume its speech
             $isspeech = true;
             //$isspeech = !utils::is_textonlysubmission($moduleinstance);
-            $llmresponse = utils::fetch_ai_grade($token, $region, $targetlanguage, $isspeech, $studentresponse, $instructions);
+            $llmresponse = utils::fetch_ai_grade(
+                $token,
+                $region,
+                $targetlanguage,
+                $isspeech,
+                $studentresponse,
+                $instructions,
+                $context->id
+            );
             //   error_log(print_r($llmresponse, true));
             if (!$llmresponse) {
                 $contentobject = ["correctedtext" => "An error occurred", "feedback" => ["Invalid response received from server. Could be a network issue, or possibly a Poodll auth issue."], "marks" => 0];
